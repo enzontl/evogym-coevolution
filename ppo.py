@@ -1,7 +1,8 @@
 """PPO with continuous actions (Gaussian policy), adapted from the course PPO (TD6).
 
 Lines marked `# CHANGED` / `# ADDED` differ from the TD6 version (discrete actions, LunarLander).
-Contents: ActorCriticNetwork, PPOAgent, to_env_action, RunningMeanStd, make_vec_env, train_agent, test_agent.
+Contents: ActorCriticNetwork, PPOAgent, to_env_action, RunningMeanStd, ROBOTS / load_body / make_env (EvoGym
+bodies), make_vec_env, train_agent, test_agent.
 Training runs n_envs copies of the environment in parallel (buffers are (T, n_envs)).
 
 Command line (see `python ppo.py --help`):
@@ -218,13 +219,42 @@ class RunningMeanStd:
         self.count = total
 
 
-def make_vec_env(env_id, n_envs, vectorization="async"):
+# Hand-designed EvoGym bodies. Voxels: 0 empty, 1 rigid, 2 soft, 3 horizontal actuator, 4 vertical actuator.
+ROBOTS = {
+    "walker": [[1, 1, 1, 1, 1],
+               [3, 3, 3, 3, 3],
+               [3, 3, 0, 3, 3],
+               [4, 4, 0, 4, 4],
+               [4, 4, 0, 4, 4]],
+}
+
+
+def load_body(robot):
+    """ADDED: a body from its name in ROBOTS or from a JSON file containing a 2D list of voxels."""
+    if robot in ROBOTS:
+        return np.array(ROBOTS[robot])
+    return np.array(json.loads(Path(robot).read_text()))
+
+
+def make_env(env_id, env_kwargs=None, render_mode=None):
+    """ADDED: one env. EvoGym envs (env_kwargs with a 'body') are registered by importing evogym.envs,
+    which must happen inside each worker process too (otherwise 'Walker-v0 not found')."""
+    env_kwargs = dict(env_kwargs or {})
+    if "body" in env_kwargs:
+        import evogym.envs  # noqa: F401  registers the EvoGym tasks
+        from evogym import get_full_connectivity
+        env_kwargs["body"] = np.asarray(env_kwargs["body"])
+        env_kwargs.setdefault("connections", get_full_connectivity(env_kwargs["body"]))
+    return gym.make(env_id, render_mode=render_mode, **env_kwargs)
+
+
+def make_vec_env(env_id, n_envs, vectorization="async", env_kwargs=None):
     """ADDED: n copies of the env. 'async' = one process per env (slow envs like EvoGym),
     'sync' = all in this process (fast envs like Pendulum, where process overhead dominates).
     SAME_STEP autoreset: a finished env restarts in the same step() call and its last
     observation is returned in info["final_obs"]."""
     vec_cls = gym.vector.AsyncVectorEnv if vectorization == "async" else gym.vector.SyncVectorEnv
-    return vec_cls([lambda: gym.make(env_id) for _ in range(n_envs)],
+    return vec_cls([lambda: make_env(env_id, env_kwargs) for _ in range(n_envs)],
                    autoreset_mode=gym.vector.AutoresetMode.SAME_STEP)
 
 
@@ -232,7 +262,7 @@ def train_agent(total_steps=200_000, update_freq=2048, env_id="Pendulum-v1",
                 lr=3e-4, gamma=0.99, gae_lambda=0.95, entropy_beta=0.0,
                 clip_epsilon=0.2, ppo_epochs=10, batch_size=64, seed=31,
                 norm_reward=False, n_envs=8, vectorization="async", verbose=True,
-                out_dir=None, save_every=25):
+                out_dir=None, save_every=25, env_kwargs=None):
     """Train a PPO agent on n_envs parallel copies of the env.
 
     CHANGED vs TD6: the loop counts env steps (total_steps) instead of episodes, because the
@@ -246,7 +276,7 @@ def train_agent(total_steps=200_000, update_freq=2048, env_id="Pendulum-v1",
     np.random.seed(seed)
     torch.manual_seed(seed)
 
-    envs = make_vec_env(env_id, n_envs, vectorization)
+    envs = make_vec_env(env_id, n_envs, vectorization, env_kwargs)
     action_space = envs.single_action_space
     state_size = envs.single_observation_space.shape[0]
     action_size = action_space.shape[0]   # CHANGED: continuous action dimensions
@@ -332,10 +362,11 @@ def save_run(out_dir, agent, update_log, rewards_history):
     torch.save(agent.network.state_dict(), out / "model.pt")
 
 
-def test_agent(agent, env_id="Pendulum-v1", episodes=5, seed=0):
-    """Run a trained PPO agent in test mode: action = mean μ (CHANGED: was argmax)."""
-    env = gym.make(env_id)
-    totals = []
+def test_agent(agent, env_id="Pendulum-v1", episodes=5, seed=0, env_kwargs=None, gif_path=None):
+    """Run a trained PPO agent in test mode: action = mean μ (CHANGED: was argmax).
+    ADDED: env_kwargs (EvoGym body) and gif_path (GIF of the first episode, default env renderer)."""
+    env = make_env(env_id, env_kwargs, render_mode="rgb_array" if gif_path else None)
+    totals, frames = [], []
     for ep in range(episodes):
         state, _ = env.reset(seed=seed + ep)
         done, total_r = False, 0.0
@@ -346,9 +377,14 @@ def test_agent(agent, env_id="Pendulum-v1", episodes=5, seed=0):
             state, r, terminated, truncated, _ = env.step(to_env_action(mean.squeeze(0).cpu().numpy(), env.action_space))
             done = terminated or truncated
             total_r += r
+            if gif_path and ep == 0 and len(frames) < 500:
+                frames.append(env.render()[::2, ::2])  # half resolution keeps the GIF small
         totals.append(total_r)
-        print(f"Test Episode {ep+1}: {total_r:.1f}")
+        print(f"Test Episode {ep+1}: {total_r:.2f}")
     env.close()
+    if gif_path:
+        import imageio
+        imageio.mimsave(gif_path, frames[::2], duration=1 / 25, loop=0)
     return totals
 
 
@@ -368,6 +404,8 @@ def parse_args():
     p.add_argument("--ppo-epochs", type=int, default=10)
     p.add_argument("--batch-size", type=int, default=64)
     p.add_argument("--update-freq", type=int, default=2048, help="transitions per PPO update")
+    p.add_argument("--robot", default=None,
+                   help="EvoGym body: a name from ROBOTS (e.g. walker) or a JSON file with a 2D voxel list")
     p.add_argument("--norm-reward", action="store_true", help="optimisation: reward normalisation")
     p.add_argument("--out", required=True, help="output folder, e.g. runs/pendulum_norm_s31")
     return p.parse_args()
@@ -377,7 +415,9 @@ if __name__ == "__main__":
     args = parse_args()
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
-    (out / "config.json").write_text(json.dumps(vars(args), indent=2))
+    env_kwargs = {"body": load_body(args.robot)} if args.robot else None
+    config = {**vars(args), "body": env_kwargs["body"].tolist() if env_kwargs else None}
+    (out / "config.json").write_text(json.dumps(config, indent=2))
     torch.set_num_threads(1)  # tiny network; leave the cores to the env processes
 
     agent, rewards, *_ = train_agent(
@@ -385,5 +425,5 @@ if __name__ == "__main__":
         gamma=args.gamma, gae_lambda=args.gae_lambda, entropy_beta=args.entropy_beta,
         clip_epsilon=args.clip_epsilon, ppo_epochs=args.ppo_epochs, batch_size=args.batch_size,
         seed=args.seed, norm_reward=args.norm_reward, n_envs=args.n_envs,
-        vectorization=args.vectorization, out_dir=out)
+        vectorization=args.vectorization, out_dir=out, env_kwargs=env_kwargs)
     print(f"Final avg (last 100 episodes): {np.mean(rewards[-100:]):.2f} | saved to {out}/")
