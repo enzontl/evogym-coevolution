@@ -3,8 +3,18 @@
 Lines marked `# CHANGED` / `# ADDED` differ from the TD6 version (discrete actions, LunarLander).
 Contents: ActorCriticNetwork, PPOAgent, to_env_action, RunningMeanStd, make_vec_env, train_agent, test_agent.
 Training runs n_envs copies of the environment in parallel (buffers are (T, n_envs)).
+
+Command line (see `python ppo.py --help`):
+    caffeinate -i python ppo.py --env Pendulum-v1 --steps 200000 --vectorization sync \\
+        --norm-reward --seed 31 --out runs/pendulum_norm_s31
 """
+import argparse
+import json
+import time
+from pathlib import Path
+
 import numpy as np
+import pandas as pd
 import gymnasium as gym
 import torch
 import torch.nn as nn
@@ -221,12 +231,14 @@ def make_vec_env(env_id, n_envs, vectorization="async"):
 def train_agent(total_steps=200_000, update_freq=2048, env_id="Pendulum-v1",
                 lr=3e-4, gamma=0.99, gae_lambda=0.95, entropy_beta=0.0,
                 clip_epsilon=0.2, ppo_epochs=10, batch_size=64, seed=31,
-                norm_reward=False, n_envs=8, vectorization="async", verbose=True):
+                norm_reward=False, n_envs=8, vectorization="async", verbose=True,
+                out_dir=None, save_every=25):
     """Train a PPO agent on n_envs parallel copies of the env.
 
     CHANGED vs TD6: the loop counts env steps (total_steps) instead of episodes, because the
     parallel envs finish their episodes at different times. Each rollout = update_freq
     transitions in total (update_freq // n_envs steps of every env), then one PPO update.
+    If out_dir is given, logs and weights are saved there every `save_every` updates and at the end.
     """
     if total_steps < 1 or update_freq < n_envs:
         raise ValueError("total_steps must be positive and update_freq >= n_envs.")
@@ -256,6 +268,7 @@ def train_agent(total_steps=200_000, update_freq=2048, env_id="Pendulum-v1",
     rollout_steps = update_freq // n_envs
     state, _ = envs.reset(seed=seed)  # env i is seeded with seed + i
     steps, next_log = 0, 50
+    update_log, t0 = [], time.perf_counter()  # ADDED: one row per PPO update (saved as log.csv)
 
     while steps < total_steps:
         for _ in range(rollout_steps):
@@ -290,6 +303,12 @@ def train_agent(total_steps=200_000, update_freq=2048, env_id="Pendulum-v1",
         actor_loss_history.append(losses["actor_loss"])
         critic_loss_history.append(losses["critic_loss"])
         std_history.append(agent.network.log_std.exp().mean().item())
+        update_log.append({"steps": steps, "episodes": len(rewards_history),
+                           "avg100": float(np.mean(rewards_history[-100:])) if rewards_history else np.nan,
+                           "actor_loss": losses["actor_loss"], "critic_loss": losses["critic_loss"],
+                           "sigma": std_history[-1], "time_s": round(time.perf_counter() - t0, 1)})
+        if out_dir and len(update_log) % save_every == 0:
+            save_run(out_dir, agent, update_log, rewards_history)  # checkpoint: a crash keeps the progress
 
         if verbose and len(rewards_history) >= next_log:
             print(f"Steps {steps:>8,} | Ep {len(rewards_history)}: Avg100 = {np.mean(rewards_history[-100:]):.1f}, "
@@ -297,9 +316,20 @@ def train_agent(total_steps=200_000, update_freq=2048, env_id="Pendulum-v1",
             next_log += 50
 
     envs.close()
+    if out_dir:
+        save_run(out_dir, agent, update_log, rewards_history)
     if verbose:
         print("Training complete!")
     return agent, rewards_history, actor_loss_history, critic_loss_history, std_history
+
+
+def save_run(out_dir, agent, update_log, rewards_history):
+    """ADDED: write log.csv (per update), episodes.csv (per episode) and model.pt (network weights)."""
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(update_log).to_csv(out / "log.csv", index=False)
+    pd.DataFrame({"episode_return": rewards_history}).to_csv(out / "episodes.csv", index=False)
+    torch.save(agent.network.state_dict(), out / "model.pt")
 
 
 def test_agent(agent, env_id="Pendulum-v1", episodes=5, seed=0):
@@ -320,3 +350,40 @@ def test_agent(agent, env_id="Pendulum-v1", episodes=5, seed=0):
         print(f"Test Episode {ep+1}: {total_r:.1f}")
     env.close()
     return totals
+
+
+def parse_args():
+    p = argparse.ArgumentParser(description="Train continuous-action PPO (course TD6 defaults).")
+    p.add_argument("--env", default="Pendulum-v1", help="Gymnasium env id")
+    p.add_argument("--steps", type=int, default=200_000, help="total env steps (all envs together)")
+    p.add_argument("--n-envs", type=int, default=8)
+    p.add_argument("--vectorization", choices=["sync", "async"], default="async",
+                   help="sync for fast envs (Pendulum), async for slow ones (EvoGym)")
+    p.add_argument("--seed", type=int, default=31)
+    p.add_argument("--lr", type=float, default=3e-4)
+    p.add_argument("--gamma", type=float, default=0.99)
+    p.add_argument("--gae-lambda", type=float, default=0.95)
+    p.add_argument("--entropy-beta", type=float, default=0.0)
+    p.add_argument("--clip-epsilon", type=float, default=0.2)
+    p.add_argument("--ppo-epochs", type=int, default=10)
+    p.add_argument("--batch-size", type=int, default=64)
+    p.add_argument("--update-freq", type=int, default=2048, help="transitions per PPO update")
+    p.add_argument("--norm-reward", action="store_true", help="optimisation: reward normalisation")
+    p.add_argument("--out", required=True, help="output folder, e.g. runs/pendulum_norm_s31")
+    return p.parse_args()
+
+
+if __name__ == "__main__":
+    args = parse_args()
+    out = Path(args.out)
+    out.mkdir(parents=True, exist_ok=True)
+    (out / "config.json").write_text(json.dumps(vars(args), indent=2))
+    torch.set_num_threads(1)  # tiny network; leave the cores to the env processes
+
+    agent, rewards, *_ = train_agent(
+        total_steps=args.steps, update_freq=args.update_freq, env_id=args.env, lr=args.lr,
+        gamma=args.gamma, gae_lambda=args.gae_lambda, entropy_beta=args.entropy_beta,
+        clip_epsilon=args.clip_epsilon, ppo_epochs=args.ppo_epochs, batch_size=args.batch_size,
+        seed=args.seed, norm_reward=args.norm_reward, n_envs=args.n_envs,
+        vectorization=args.vectorization, out_dir=out)
+    print(f"Final avg (last 100 episodes): {np.mean(rewards[-100:]):.2f} | saved to {out}/")
