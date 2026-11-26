@@ -11,8 +11,10 @@ genealogy (`parent_ids`, `operator`, per-generation artifacts) for Steps 6–8.
 
 Example:
     caffeinate -i uv run --python .venv/bin/python evolve.py \
-        --env Walker-v0 --pop-size 8 --generations 10 --steps 400000 \
-        --n-envs 8 --seed 31 --out runs/evo_walker_s31
+        --env Walker-v0 --pop-size 8 --generations 10 --steps 500000 \
+        --elites 2 --survivors 3 --mutation-rate 0.12 --mutation-rate-end 0.06 \
+        --reval-top-k 3 --reval-seeds 31 32 33 --reval-ref walker \
+        --n-envs 8 --seed 31 --out runs/evo_walker_500k_s31
 """
 
 import argparse
@@ -26,7 +28,7 @@ import numpy as np
 import pandas as pd
 import torch
 
-from ppo import PPOAgent, make_env, to_env_action, train_agent
+from ppo import PPOAgent, load_body, make_env, to_env_action, train_agent
 
 # EvoGym default sampling distribution over voxels:
 # 0 empty, 1 rigid, 2 soft, 3 horizontal actuator, 4 vertical actuator.
@@ -390,16 +392,48 @@ def _filter_ppo_kwargs(raw_kwargs: dict) -> dict:
 # ---------------------------------------------------------------------------
 
 
-def _select_parent(
-    survivors: list[dict],
-    rng: np.random.Generator,
-) -> dict:
-    """Rank-weighted parent selection among sorted top survivors."""
-    n = len(survivors)
-    weights = np.arange(n, 0, -1, dtype=np.float64)
-    weights /= weights.sum()
-    idx = int(rng.choice(n, p=weights))
-    return survivors[idx]
+def _build_parent_schedule(survivors: list[dict], n_children: int) -> list[dict]:
+    """Allocate mutated children deterministically across sorted top survivors.
+
+    Uses rank-proportional largest-remainder allocation (weights k, k-1, ..., 1)
+    so the #1 champion always receives the most offspring and every top survivor
+    gets at least one child whenever n_children >= len(survivors).
+    Example: 3 survivors, 6 children -> [3, 2, 1].
+    """
+    if n_children <= 0:
+        return []
+    if not survivors:
+        raise ValueError("Cannot allocate children from an empty survivors list.")
+    k = len(survivors)
+    ranks = np.arange(k, 0, -1, dtype=np.float64)
+    raw = ranks / ranks.sum() * n_children
+    counts = np.floor(raw).astype(int)
+    if n_children >= k:
+        zeros = counts == 0
+        if zeros.any():
+            counts[zeros] = 1
+            while int(counts.sum()) > n_children:
+                idx = int(np.argmax(counts))
+                counts[idx] -= 1
+    rem = n_children - int(counts.sum())
+    if rem > 0:
+        order = np.argsort(-(raw - counts))
+        for i in order[:rem]:
+            counts[int(i)] += 1
+    schedule: list[dict] = []
+    for surv, count in zip(survivors, counts):
+        schedule.extend([surv] * int(count))
+    return schedule
+
+
+def _generation_mutation_rate(
+    gen: int, total_generations: int, start_rate: float, end_rate: float
+) -> float:
+    """Linearly anneal mutation rate from start_rate (gen 1) to end_rate (final gen)."""
+    if total_generations <= 2 or gen <= 1:
+        return float(start_rate)
+    progress = min(1.0, (gen - 1) / (total_generations - 2))
+    return float(start_rate + progress * (end_rate - start_rate))
 
 
 def _write_summaries(out_dir: Path, history: dict) -> None:
@@ -478,15 +512,22 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--eval-episodes must be >= 1.")
     if not (0.0 <= args.mutation_rate <= 1.0):
         raise ValueError("--mutation-rate must be in [0.0, 1.0].")
+    if args.mutation_rate_end is not None and not (
+        0.0 <= args.mutation_rate_end <= 1.0
+    ):
+        raise ValueError("--mutation-rate-end must be in [0.0, 1.0].")
+    if args.steps < 1:
+        raise ValueError("--steps must be >= 1.")
+    if args.n_envs < 1:
+        raise ValueError("--n-envs must be >= 1.")
+    if args.reval_top_k < 0:
+        raise ValueError("--reval-top-k must be >= 0.")
+    if args.reval_steps is not None and args.reval_steps < 1:
+        raise ValueError("--reval-steps must be >= 1.")
 
 
-def run_evolution(args: argparse.Namespace) -> dict:
-    """Run (or resume) the mutation-only genetic algorithm."""
-    _validate_args(args)
-    out_dir = Path(args.out)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    torch.set_num_threads(1)
-
+def _build_ppo_kwargs(args: argparse.Namespace) -> dict:
+    """Build filtered PPO kwargs from CLI flags and optional --ppo-config JSON."""
     ppo_kwargs = {
         "total_steps": args.steps,
         "update_freq": args.update_freq,
@@ -508,10 +549,24 @@ def run_evolution(args: argparse.Namespace) -> dict:
         ppo_kwargs.update(overrides)
         ppo_kwargs["env_id"] = args.env
         ppo_kwargs["total_steps"] = args.steps
-    ppo_kwargs = _filter_ppo_kwargs(ppo_kwargs)
+    return _filter_ppo_kwargs(ppo_kwargs)
+
+
+def run_evolution(args: argparse.Namespace) -> dict:
+    """Run (or resume) the mutation-only genetic algorithm."""
+    _validate_args(args)
+    out_dir = Path(args.out)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    torch.set_num_threads(1)
+
+    ppo_kwargs = _build_ppo_kwargs(args)
+    mut_end = (
+        args.mutation_rate if args.mutation_rate_end is None else args.mutation_rate_end
+    )
 
     evo_config = {
         **vars(args),
+        "mutation_rate_end": mut_end,
         "effective_ppo_kwargs": ppo_kwargs,
         "fitness_formula": "det_return + w_speed * 1[goal] * (max_steps - steps)/max_steps - w_energy * norm_effort - w_jerk * norm_jerk",
     }
@@ -572,9 +627,14 @@ def run_evolution(args: argparse.Namespace) -> dict:
                 elites = ranked[:n_elites]
                 survivors = ranked[:n_survivors]
 
+                gen_mut_rate = _generation_mutation_rate(
+                    gen, args.generations, args.mutation_rate, mut_end
+                )
+                n_mutants = args.pop_size - n_elites
+                parent_schedule = _build_parent_schedule(survivors, n_mutants)
                 print(
                     f"\n=== Generation {gen:02d}/{args.generations - 1:02d} "
-                    f"(elites={n_elites}, mutants={args.pop_size - n_elites}, survivors={n_survivors}) ==="
+                    f"(elites={n_elites}, mutants={n_mutants}, survivors={n_survivors}, p_mut={gen_mut_rate:.3f}) ==="
                 )
 
                 for ind_idx, elite in enumerate(elites):
@@ -590,12 +650,11 @@ def run_evolution(args: argparse.Namespace) -> dict:
                         }
                     )
 
-                for ind_idx in range(n_elites, args.pop_size):
-                    parent = _select_parent(survivors, rng)
+                for ind_idx, parent in enumerate(parent_schedule, start=n_elites):
                     child, n_changed = mutate_body(
                         np.array(parent["body"], dtype=int),
                         rng=rng,
-                        mutation_rate=args.mutation_rate,
+                        mutation_rate=gen_mut_rate,
                         seen_hashes=seen_hashes,
                     )
                     bhash = canonical_body_hash(child)
@@ -769,7 +828,219 @@ def run_evolution(args: argparse.Namespace) -> dict:
         f"| ret={champion['metrics']['det_return']:.2f} | steps={champion['metrics']['steps']:.0f} "
         f"| cot={champion['metrics']['cost_of_transport']} | saved to {out_dir}/"
     )
+    if args.reval_top_k > 0 and args.reval_seeds:
+        run_reevaluation(out_dir, history, args, ppo_kwargs)
     return history
+
+
+def run_reevaluation(
+    out_dir: Path,
+    history: dict,
+    args: argparse.Namespace,
+    ppo_kwargs: dict | None = None,
+) -> pd.DataFrame:
+    """Re-train the top-K unique evolved bodies, best Gen-0 body, and optional
+    hand-designed reference across multiple PPO seeds to eliminate lucky-seed
+    elite bias and compare pure speed alongside energy efficiency.
+    """
+    torch.set_num_threads(1)
+    reval_dir = out_dir / "reval"
+    reval_dir.mkdir(parents=True, exist_ok=True)
+
+    base_ppo = dict(ppo_kwargs or _build_ppo_kwargs(args))
+    reval_steps = int(args.reval_steps or base_ppo.get("total_steps", args.steps))
+    base_ppo["total_steps"] = reval_steps
+    env_id = base_ppo.get("env_id", args.env)
+
+    # Deduplicate all unique morphologies trained during evolution by canonical hash.
+    unique_by_hash: dict[str, dict] = {}
+    for gen_rec in history["generations"]:
+        for ind in gen_rec["individuals"]:
+            h = ind["body_hash"]
+            if (
+                h not in unique_by_hash
+                or ind["metrics"]["fitness"] > unique_by_hash[h]["metrics"]["fitness"]
+            ):
+                unique_by_hash[h] = ind
+
+    ranked_unique = sorted(
+        unique_by_hash.values(), key=lambda x: x["metrics"]["fitness"], reverse=True
+    )
+
+    candidates: list[dict] = []
+    added_hashes: set[str] = set()
+    for rank, ind in enumerate(ranked_unique[: args.reval_top_k], start=1):
+        candidates.append(
+            {
+                "label": f"top{rank}_{ind['origin_id']}",
+                "group": "evolved",
+                "origin_id": ind["origin_id"],
+                "body_hash": ind["body_hash"],
+                "body": ind["body"],
+            }
+        )
+        added_hashes.add(ind["body_hash"])
+
+    if history["generations"]:
+        gen0_best = max(
+            history["generations"][0]["individuals"],
+            key=lambda x: x["metrics"]["fitness"],
+        )
+        if gen0_best["body_hash"] not in added_hashes:
+            candidates.append(
+                {
+                    "label": f"gen0_best_{gen0_best['origin_id']}",
+                    "group": "gen0_random",
+                    "origin_id": gen0_best["origin_id"],
+                    "body_hash": gen0_best["body_hash"],
+                    "body": gen0_best["body"],
+                }
+            )
+            added_hashes.add(gen0_best["body_hash"])
+
+    if args.reval_ref and args.reval_ref.lower() != "none":
+        ref_body = load_body(args.reval_ref).astype(int)
+        ref_name = Path(args.reval_ref).stem
+        candidates.append(
+            {
+                "label": f"ref_{ref_name}",
+                "group": "hand_designed",
+                "origin_id": ref_name,
+                "body_hash": canonical_body_hash(ref_body),
+                "body": ref_body.tolist(),
+            }
+        )
+
+    print(
+        f"\n=== Multi-Seed Re-Evaluation ({len(candidates)} bodies x "
+        f"{len(args.reval_seeds)} seeds @ {reval_steps:,} steps) ==="
+    )
+
+    run_rows = []
+    for cand in candidates:
+        body = np.array(cand["body"], dtype=int)
+        for seed in args.reval_seeds:
+            run_dir = reval_dir / f"{cand['label']}_s{seed}"
+            run_dir.mkdir(parents=True, exist_ok=True)
+            (run_dir / "body.json").write_text(json.dumps(cand["body"], indent=2))
+            eval_path = run_dir / "eval.json"
+
+            if eval_path.exists():
+                rec = json.loads(eval_path.read_text())
+                cached_steps = rec.get("reval_steps")
+                if cached_steps is not None and cached_steps != reval_steps:
+                    print(
+                        f"  [warn  ] {cand['label']} s{seed}: cached eval used {cached_steps:,} steps "
+                        f"(requested {reval_steps:,}); keeping cached result."
+                    )
+                tag = "resume"
+            else:
+                run_cfg = {
+                    **base_ppo,
+                    "seed": seed,
+                    "label": cand["label"],
+                    "group": cand["group"],
+                    "body_hash": cand["body_hash"],
+                    "body": cand["body"],
+                }
+                (run_dir / "config.json").write_text(json.dumps(run_cfg, indent=2))
+                t0 = time.perf_counter()
+                agent, rewards, *_ = train_agent(
+                    **base_ppo,
+                    seed=seed,
+                    out_dir=run_dir,
+                    env_kwargs={"body": body},
+                )
+                train_time_s = round(time.perf_counter() - t0, 1)
+                train_avg100 = (
+                    round(float(np.mean(rewards[-100:])), 4) if rewards else None
+                )
+                metrics = evaluate_policy(
+                    agent=agent,
+                    body=body,
+                    env_id=env_id,
+                    episodes=args.eval_episodes,
+                    seed=args.eval_seed,
+                    w_speed=args.w_speed,
+                    w_energy=args.w_energy,
+                    w_jerk=args.w_jerk,
+                )
+                rec = {
+                    "label": cand["label"],
+                    "group": cand["group"],
+                    "origin_id": cand["origin_id"],
+                    "body_hash": cand["body_hash"],
+                    "seed": seed,
+                    "reval_steps": reval_steps,
+                    "train_time_s": train_time_s,
+                    "train_avg100": train_avg100,
+                    "metrics": metrics,
+                }
+                eval_path.write_text(json.dumps(rec, indent=2))
+                tag = "train "
+
+            m = rec["metrics"]
+            print(
+                f"  [{tag}] {cand['label']:22s} s{seed} | "
+                f"ret={m['det_return']:6.2f} steps={m['steps']:5.0f} goal={int(m['goal_reached'])} "
+                f"spd={m['avg_speed'] * 100:.2f} | cot={m['cost_of_transport']} "
+                f"eff={m['norm_effort']:.3f} | fit={m['fitness']:6.2f}"
+            )
+            run_rows.append(
+                {
+                    "label": cand["label"],
+                    "group": cand["group"],
+                    "origin_id": cand["origin_id"],
+                    "body_hash": cand["body_hash"],
+                    "seed": seed,
+                    "reval_steps": rec.get("reval_steps", reval_steps),
+                    "train_time_s": rec["train_time_s"],
+                    "train_avg100": rec["train_avg100"],
+                    **m,
+                }
+            )
+
+    runs_df = pd.DataFrame(run_rows)
+    runs_df.to_csv(reval_dir / "reval_runs.csv", index=False)
+
+    summary_rows = []
+    for cand in candidates:
+        sub = runs_df[runs_df["label"] == cand["label"]]
+        valid_cot = sub["cost_of_transport"].dropna()
+        summary_rows.append(
+            {
+                "label": cand["label"],
+                "group": cand["group"],
+                "n_seeds": len(sub),
+                "reval_steps": reval_steps,
+                # Pure performance / speed metrics (no energy penalty)
+                "det_return_mean": round(float(sub["det_return"].mean()), 3),
+                "det_return_std": round(float(sub["det_return"].std(ddof=0)), 3),
+                "steps_mean": round(float(sub["steps"].mean()), 1),
+                "steps_std": round(float(sub["steps"].std(ddof=0)), 1),
+                "avg_speed_mean": round(float(sub["avg_speed"].mean()), 5),
+                "goal_rate": round(float(sub["goal_reached"].mean()), 3),
+                # Energy efficiency metrics
+                "cot_mean": round(float(valid_cot.mean()), 2)
+                if len(valid_cot)
+                else None,
+                "cot_std": round(float(valid_cot.std(ddof=0)), 2)
+                if len(valid_cot)
+                else None,
+                "norm_effort_mean": round(float(sub["norm_effort"].mean()), 4),
+                "n_voxels": int(sub["n_voxels"].iloc[0]),
+                "n_actuators": int(sub["n_actuators"].iloc[0]),
+                # Composite organic fitness
+                "fitness_mean": round(float(sub["fitness"].mean()), 3),
+                "fitness_std": round(float(sub["fitness"].std(ddof=0)), 3),
+            }
+        )
+
+    summary_df = pd.DataFrame(summary_rows)
+    summary_df.to_csv(reval_dir / "reval_summary.csv", index=False)
+    print("\n=== Multi-Seed Re-Evaluation Summary (Pure Speed + Energy + Fitness) ===")
+    print(summary_df.to_string(index=False))
+    return summary_df
 
 
 def parse_args() -> argparse.Namespace:
@@ -803,14 +1074,20 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--survivors",
         type=int,
-        default=4,
-        help="Top survivors eligible as mutation parents",
+        default=3,
+        help="Top survivors with guaranteed rank-proportional offspring",
     )
     p.add_argument(
         "--mutation-rate",
         type=float,
         default=0.12,
-        help="Per-voxel mutation probability",
+        help="Initial per-voxel mutation probability (gen 1)",
+    )
+    p.add_argument(
+        "--mutation-rate-end",
+        type=float,
+        default=0.06,
+        help="Final per-voxel mutation probability (linearly annealed to final gen)",
     )
     p.add_argument(
         "--grid-size", type=int, default=5, help="Square voxel grid size (default 5x5)"
@@ -851,13 +1128,44 @@ def parse_args() -> argparse.Namespace:
         help="Save a GIF of each generation's best robot",
     )
 
+    # Post-evolution multi-seed re-evaluation (eliminates lucky-seed elite bias)
+    p.add_argument(
+        "--reval-top-k",
+        type=int,
+        default=0,
+        help="Re-train top-K unique evolved bodies across --reval-seeds (0 disables)",
+    )
+    p.add_argument(
+        "--reval-seeds",
+        type=int,
+        nargs="+",
+        default=[31, 32, 33],
+        help="Seeds for post-evolution multi-seed re-evaluation",
+    )
+    p.add_argument(
+        "--reval-steps",
+        type=int,
+        default=None,
+        help="PPO env steps per seed during re-evaluation (defaults to --steps)",
+    )
+    p.add_argument(
+        "--reval-ref",
+        default="walker",
+        help="External reference robot to include in re-evaluation ('none' to skip)",
+    )
+    p.add_argument(
+        "--reval-only",
+        action="store_true",
+        help="Skip evolution and run multi-seed re-evaluation on an existing --out run",
+    )
+
     # Inner-loop PPO settings (forwarded directly to ppo.train_agent without modifying ppo.py)
     p.add_argument(
         "--ppo-config",
         default=None,
         help="Optional JSON file overriding PPO kwargs (e.g. Step 4 best PPO)",
     )
-    p.add_argument("--steps", type=int, default=400_000, help="PPO env steps per robot")
+    p.add_argument("--steps", type=int, default=500_000, help="PPO env steps per robot")
     p.add_argument("--n-envs", type=int, default=8, help="Parallel envs per robot")
     p.add_argument("--vectorization", choices=["sync", "async"], default="async")
     p.add_argument("--lr", type=float, default=3e-4)
@@ -876,4 +1184,33 @@ def parse_args() -> argparse.Namespace:
 
 
 if __name__ == "__main__":
-    run_evolution(parse_args())
+    cli_args = parse_args()
+    if cli_args.reval_only:
+        _validate_args(cli_args)
+        out_path = Path(cli_args.out)
+        hist_path = out_path / "evolution_history.json"
+        if not hist_path.exists():
+            raise FileNotFoundError(f"Cannot run --reval-only: missing {hist_path}.")
+        saved_history = json.loads(hist_path.read_text())
+        saved_cfg = saved_history.get("config", {})
+        # Inherit original evolution's env, fitness weights, and eval config for apples-to-apples re-eval.
+        for key in (
+            "env",
+            "w_speed",
+            "w_energy",
+            "w_jerk",
+            "eval_episodes",
+            "eval_seed",
+        ):
+            if key in saved_cfg:
+                setattr(cli_args, key, saved_cfg[key])
+        if cli_args.reval_top_k == 0:
+            cli_args.reval_top_k = 3
+        saved_ppo = saved_cfg.get("effective_ppo_kwargs")
+        if saved_ppo and not cli_args.ppo_config:
+            ppo_for_reval = _filter_ppo_kwargs(saved_ppo)
+        else:
+            ppo_for_reval = _build_ppo_kwargs(cli_args)
+        run_reevaluation(out_path, saved_history, cli_args, ppo_kwargs=ppo_for_reval)
+    else:
+        run_evolution(cli_args)
