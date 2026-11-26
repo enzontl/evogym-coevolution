@@ -294,6 +294,8 @@ def train_agent(total_steps=200_000, update_freq=2048, env_id="Pendulum-v1",
     reward_rms = RunningMeanStd() if norm_reward else None  # ADDED: std of the discounted return (shared)
     disc_return = np.zeros(n_envs)                          # one discounted return per env
     ep_reward = np.zeros(n_envs)                            # raw episode return per env
+    ep_length = np.zeros(n_envs, dtype=int)                 # ADDED: steps per episode (< limit = goal reached on EvoGym)
+    length_history = []
 
     rollout_steps = update_freq // n_envs
     state, _ = envs.reset(seed=seed)  # env i is seeded with seed + i
@@ -323,9 +325,11 @@ def train_agent(total_steps=200_000, update_freq=2048, env_id="Pendulum-v1",
             agent.store(state, action, stored_reward, value, done, log_prob)  # unclipped action stored
 
             ep_reward += reward
+            ep_length += 1
             for i in np.flatnonzero(done):
                 rewards_history.append(ep_reward[i])
-                ep_reward[i] = 0.0
+                length_history.append(int(ep_length[i]))
+                ep_reward[i], ep_length[i] = 0.0, 0
             state = next_state
             steps += n_envs
 
@@ -338,7 +342,7 @@ def train_agent(total_steps=200_000, update_freq=2048, env_id="Pendulum-v1",
                            "actor_loss": losses["actor_loss"], "critic_loss": losses["critic_loss"],
                            "sigma": std_history[-1], "time_s": round(time.perf_counter() - t0, 1)})
         if out_dir and len(update_log) % save_every == 0:
-            save_run(out_dir, agent, update_log, rewards_history)  # checkpoint: a crash keeps the progress
+            save_run(out_dir, agent, update_log, rewards_history, length_history)  # checkpoint: a crash keeps the progress
 
         if verbose and len(rewards_history) >= next_log:
             print(f"Steps {steps:>8,} | Ep {len(rewards_history)}: Avg100 = {np.mean(rewards_history[-100:]):.1f}, "
@@ -347,18 +351,21 @@ def train_agent(total_steps=200_000, update_freq=2048, env_id="Pendulum-v1",
 
     envs.close()
     if out_dir:
-        save_run(out_dir, agent, update_log, rewards_history)
+        save_run(out_dir, agent, update_log, rewards_history, length_history)
     if verbose:
         print("Training complete!")
     return agent, rewards_history, actor_loss_history, critic_loss_history, std_history
 
 
-def save_run(out_dir, agent, update_log, rewards_history):
-    """ADDED: write log.csv (per update), episodes.csv (per episode) and model.pt (network weights)."""
+def save_run(out_dir, agent, update_log, rewards_history, length_history=None):
+    """ADDED: write log.csv (per update), episodes.csv (return and length per episode) and model.pt (network weights)."""
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     pd.DataFrame(update_log).to_csv(out / "log.csv", index=False)
-    pd.DataFrame({"episode_return": rewards_history}).to_csv(out / "episodes.csv", index=False)
+    episodes = {"episode_return": rewards_history}
+    if length_history is not None:
+        episodes["length"] = length_history  # ADDED: episode length in steps
+    pd.DataFrame(episodes).to_csv(out / "episodes.csv", index=False)
     torch.save(agent.network.state_dict(), out / "model.pt")
 
 
