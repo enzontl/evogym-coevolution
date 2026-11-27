@@ -1,0 +1,6 @@
+label,group,n_seeds,reval_steps,det_return_mean,det_return_std,steps_mean,steps_std,avg_speed_mean,goal_rate,cot_mean,cot_std,norm_effort_mean,n_voxels,n_actuators,fitness_mean,fitness_std
+top1_gen08_ind05,evolved,3,500000,10.548,0.008,484.7,3.9,0.0197,1.0,369.26,0.98,0.291,19,14,10.491,0.027
+top2_gen09_ind07,evolved,3,500000,7.622,2.084,479.0,29.7,0.0155,0.333,509.43,132.11,0.2919,18,13,7.597,2.262
+top3_gen08_ind03,evolved,3,500000,10.568,0.007,460.3,4.2,0.02078,1.0,282.54,3.33,0.2349,19,11,10.679,0.032
+gen0_best_gen00_ind07,gen0_random,3,500000,6.818,0.577,500.0,0.0,0.01363,0.0,389.2,38.56,0.2109,17,9,6.7,0.575
+ref_walker,hand_designed,3,500000,10.221,0.497,464.7,29.8,0.02065,0.667,448.49,55.2,0.3674,22,17,10.248,0.662
