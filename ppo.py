@@ -24,7 +24,7 @@ import torch.optim as optim
 
 
 class ActorCriticNetwork(nn.Module):
-    def __init__(self, state_size, action_size, hidden_size=128, separate_critic=False):
+    def __init__(self, state_size, action_size, hidden_size=128, separate_critic=False, log_std_init=0.0):
         super().__init__()
         self.shared = nn.Sequential(
             nn.Linear(state_size, hidden_size),
@@ -34,7 +34,7 @@ class ActorCriticNetwork(nn.Module):
         )
         self.actor = nn.Linear(hidden_size, action_size)      # CHANGED: mean μ of a Gaussian, no softmax
         self.critic = nn.Linear(hidden_size, 1)
-        self.log_std = nn.Parameter(torch.zeros(action_size))  # ADDED: learned log σ (state-independent)
+        self.log_std = nn.Parameter(torch.full((action_size,), float(log_std_init)))  # ADDED: learned log σ (state-independent); 4d: start value
         # ADDED (step 4b): observation statistics, saved in model.pt with the weights. obs_count = 0 -> no normalisation.
         self.register_buffer("obs_mean", torch.zeros(state_size))
         self.register_buffer("obs_var", torch.ones(state_size))
@@ -76,7 +76,7 @@ class ActorCriticNetwork(nn.Module):
 class PPOAgent:
     def __init__(
         self, lr=3e-4, gamma=0.99, state_size=3, action_size=1,
-        gae_lambda=0.95, entropy_beta=0.0, clip_epsilon=0.2, ppo_epochs=10, batch_size=64, separate_critic=False
+        gae_lambda=0.95, entropy_beta=0.0, clip_epsilon=0.2, ppo_epochs=10, batch_size=64, separate_critic=False, log_std_init=0.0
     ):
         # Hyperparameters
         self.lr = lr
@@ -95,7 +95,8 @@ class PPOAgent:
         self.device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
         print(f"Using device: {self.device}")
 
-        self.network = ActorCriticNetwork(state_size, action_size, separate_critic=separate_critic).to(self.device)
+        self.network = ActorCriticNetwork(state_size, action_size, separate_critic=separate_critic,
+                                           log_std_init=log_std_init).to(self.device)
         self.optimizer = optim.Adam(self.network.parameters(), lr=lr)
         self.reset_memory()
 
@@ -291,7 +292,7 @@ def make_vec_env(env_id, n_envs, vectorization="async", env_kwargs=None):
 def train_agent(total_steps=200_000, update_freq=2048, env_id="Pendulum-v1",
                 lr=3e-4, gamma=0.99, gae_lambda=0.95, entropy_beta=0.0,
                 clip_epsilon=0.2, ppo_epochs=10, batch_size=64, seed=31,
-                norm_reward=False, norm_obs=False, separate_critic=False, n_envs=8, vectorization="async", verbose=True,
+                norm_reward=False, norm_obs=False, separate_critic=False, log_std_init=0.0, n_envs=8, vectorization="async", verbose=True,
                 out_dir=None, save_every=25, env_kwargs=None):
     """Train a PPO agent on n_envs parallel copies of the env.
 
@@ -316,7 +317,8 @@ def train_agent(total_steps=200_000, update_freq=2048, env_id="Pendulum-v1",
 
     agent = PPOAgent(state_size=state_size, action_size=action_size, lr=lr, gamma=gamma,
                      gae_lambda=gae_lambda, entropy_beta=entropy_beta, clip_epsilon=clip_epsilon,
-                     ppo_epochs=ppo_epochs, batch_size=batch_size, separate_critic=separate_critic)
+                     ppo_epochs=ppo_epochs, batch_size=batch_size, separate_critic=separate_critic,
+                     log_std_init=log_std_init)
 
     rewards_history, actor_loss_history, critic_loss_history = [], [], []
     std_history = []  # ADDED: policy σ after each update (exploration should shrink)
@@ -452,6 +454,7 @@ def parse_args():
     p.add_argument("--norm-reward", action="store_true", help="optimisation: reward normalisation")
     p.add_argument("--norm-obs", action="store_true", help="optimisation: observation normalisation (inside the network)")
     p.add_argument("--separate-critic", action="store_true", help="optimisation: actor and critic without a shared trunk")
+    p.add_argument("--log-std-init", type=float, default=0.0, help="optimisation: initial log σ (0 -> σ=1, -0.69 -> σ=0.5)")
     p.add_argument("--out", required=True, help="output folder, e.g. runs/pendulum_norm_s31")
     return p.parse_args()
 
@@ -469,6 +472,6 @@ if __name__ == "__main__":
         total_steps=args.steps, update_freq=args.update_freq, env_id=args.env, lr=args.lr,
         gamma=args.gamma, gae_lambda=args.gae_lambda, entropy_beta=args.entropy_beta,
         clip_epsilon=args.clip_epsilon, ppo_epochs=args.ppo_epochs, batch_size=args.batch_size,
-        seed=args.seed, norm_reward=args.norm_reward, norm_obs=args.norm_obs, separate_critic=args.separate_critic, n_envs=args.n_envs,
+        seed=args.seed, norm_reward=args.norm_reward, norm_obs=args.norm_obs, separate_critic=args.separate_critic, log_std_init=args.log_std_init, n_envs=args.n_envs,
         vectorization=args.vectorization, out_dir=out, env_kwargs=env_kwargs)
     print(f"Final avg (last 100 episodes): {np.mean(rewards[-100:]):.2f} | saved to {out}/")
