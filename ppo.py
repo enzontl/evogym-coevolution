@@ -24,7 +24,7 @@ import torch.optim as optim
 
 
 class ActorCriticNetwork(nn.Module):
-    def __init__(self, state_size, action_size, hidden_size=128):
+    def __init__(self, state_size, action_size, hidden_size=128, separate_critic=False):
         super().__init__()
         self.shared = nn.Sequential(
             nn.Linear(state_size, hidden_size),
@@ -39,6 +39,12 @@ class ActorCriticNetwork(nn.Module):
         self.register_buffer("obs_mean", torch.zeros(state_size))
         self.register_buffer("obs_var", torch.ones(state_size))
         self.register_buffer("obs_count", torch.zeros(()))
+        # ADDED (step 4c): optional separate trunk for the critic (created last, so the default network is unchanged)
+        self.critic_shared = self._critic_trunk(state_size, hidden_size) if separate_critic else None
+
+    @staticmethod
+    def _critic_trunk(state_size, hidden_size):
+        return nn.Sequential(nn.Linear(state_size, hidden_size), nn.Tanh(), nn.Linear(hidden_size, hidden_size), nn.Tanh())
 
     def set_obs_stats(self, rms):
         """ADDED: copy a RunningMeanStd into the buffers (turns observation normalisation on)."""
@@ -49,6 +55,10 @@ class ActorCriticNetwork(nn.Module):
     def load_state_dict(self, state_dict, strict=True):
         """ADDED: model.pt files saved before step 4b have no obs_* buffers -> keep them at 'no normalisation'."""
         state_dict = dict(state_dict)
+        if self.critic_shared is None and "critic_shared.0.weight" in state_dict:
+            # ADDED (4c): a model trained with --separate-critic. shortcut: inference only (the optimizer does not see this trunk)
+            w = state_dict["critic_shared.0.weight"]
+            self.critic_shared = self._critic_trunk(w.shape[1], w.shape[0]).to(w.device)
         for k, v in self.state_dict().items():
             if k.startswith("obs_"):
                 state_dict.setdefault(k, v)
@@ -59,14 +69,14 @@ class ActorCriticNetwork(nn.Module):
             x = torch.clamp((x - self.obs_mean) / torch.sqrt(self.obs_var + 1e-8), -10.0, 10.0)
         features = self.shared(x)
         mean = self.actor(features)
-        state_value = self.critic(features)
+        state_value = self.critic(features if self.critic_shared is None else self.critic_shared(x))  # CHANGED (4c)
         return mean, self.log_std.expand_as(mean), state_value  # CHANGED: (μ, log σ, V) instead of (probs, V)
 
 
 class PPOAgent:
     def __init__(
         self, lr=3e-4, gamma=0.99, state_size=3, action_size=1,
-        gae_lambda=0.95, entropy_beta=0.0, clip_epsilon=0.2, ppo_epochs=10, batch_size=64
+        gae_lambda=0.95, entropy_beta=0.0, clip_epsilon=0.2, ppo_epochs=10, batch_size=64, separate_critic=False
     ):
         # Hyperparameters
         self.lr = lr
@@ -85,7 +95,7 @@ class PPOAgent:
         self.device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
         print(f"Using device: {self.device}")
 
-        self.network = ActorCriticNetwork(state_size, action_size).to(self.device)
+        self.network = ActorCriticNetwork(state_size, action_size, separate_critic=separate_critic).to(self.device)
         self.optimizer = optim.Adam(self.network.parameters(), lr=lr)
         self.reset_memory()
 
@@ -281,7 +291,7 @@ def make_vec_env(env_id, n_envs, vectorization="async", env_kwargs=None):
 def train_agent(total_steps=200_000, update_freq=2048, env_id="Pendulum-v1",
                 lr=3e-4, gamma=0.99, gae_lambda=0.95, entropy_beta=0.0,
                 clip_epsilon=0.2, ppo_epochs=10, batch_size=64, seed=31,
-                norm_reward=False, norm_obs=False, n_envs=8, vectorization="async", verbose=True,
+                norm_reward=False, norm_obs=False, separate_critic=False, n_envs=8, vectorization="async", verbose=True,
                 out_dir=None, save_every=25, env_kwargs=None):
     """Train a PPO agent on n_envs parallel copies of the env.
 
@@ -306,7 +316,7 @@ def train_agent(total_steps=200_000, update_freq=2048, env_id="Pendulum-v1",
 
     agent = PPOAgent(state_size=state_size, action_size=action_size, lr=lr, gamma=gamma,
                      gae_lambda=gae_lambda, entropy_beta=entropy_beta, clip_epsilon=clip_epsilon,
-                     ppo_epochs=ppo_epochs, batch_size=batch_size)
+                     ppo_epochs=ppo_epochs, batch_size=batch_size, separate_critic=separate_critic)
 
     rewards_history, actor_loss_history, critic_loss_history = [], [], []
     std_history = []  # ADDED: policy σ after each update (exploration should shrink)
@@ -441,6 +451,7 @@ def parse_args():
                    help="EvoGym body: a name from ROBOTS (e.g. walker) or a JSON file with a 2D voxel list")
     p.add_argument("--norm-reward", action="store_true", help="optimisation: reward normalisation")
     p.add_argument("--norm-obs", action="store_true", help="optimisation: observation normalisation (inside the network)")
+    p.add_argument("--separate-critic", action="store_true", help="optimisation: actor and critic without a shared trunk")
     p.add_argument("--out", required=True, help="output folder, e.g. runs/pendulum_norm_s31")
     return p.parse_args()
 
@@ -458,6 +469,6 @@ if __name__ == "__main__":
         total_steps=args.steps, update_freq=args.update_freq, env_id=args.env, lr=args.lr,
         gamma=args.gamma, gae_lambda=args.gae_lambda, entropy_beta=args.entropy_beta,
         clip_epsilon=args.clip_epsilon, ppo_epochs=args.ppo_epochs, batch_size=args.batch_size,
-        seed=args.seed, norm_reward=args.norm_reward, norm_obs=args.norm_obs, n_envs=args.n_envs,
+        seed=args.seed, norm_reward=args.norm_reward, norm_obs=args.norm_obs, separate_critic=args.separate_critic, n_envs=args.n_envs,
         vectorization=args.vectorization, out_dir=out, env_kwargs=env_kwargs)
     print(f"Final avg (last 100 episodes): {np.mean(rewards[-100:]):.2f} | saved to {out}/")
