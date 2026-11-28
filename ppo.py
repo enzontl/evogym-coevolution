@@ -35,8 +35,28 @@ class ActorCriticNetwork(nn.Module):
         self.actor = nn.Linear(hidden_size, action_size)      # CHANGED: mean μ of a Gaussian, no softmax
         self.critic = nn.Linear(hidden_size, 1)
         self.log_std = nn.Parameter(torch.zeros(action_size))  # ADDED: learned log σ (state-independent)
+        # ADDED (step 4b): observation statistics, saved in model.pt with the weights. obs_count = 0 -> no normalisation.
+        self.register_buffer("obs_mean", torch.zeros(state_size))
+        self.register_buffer("obs_var", torch.ones(state_size))
+        self.register_buffer("obs_count", torch.zeros(()))
+
+    def set_obs_stats(self, rms):
+        """ADDED: copy a RunningMeanStd into the buffers (turns observation normalisation on)."""
+        self.obs_mean.copy_(torch.as_tensor(rms.mean))
+        self.obs_var.copy_(torch.as_tensor(rms.var))
+        self.obs_count.fill_(rms.count)
+
+    def load_state_dict(self, state_dict, strict=True):
+        """ADDED: model.pt files saved before step 4b have no obs_* buffers -> keep them at 'no normalisation'."""
+        state_dict = dict(state_dict)
+        for k, v in self.state_dict().items():
+            if k.startswith("obs_"):
+                state_dict.setdefault(k, v)
+        return super().load_state_dict(state_dict, strict)
 
     def forward(self, x):
+        if self.obs_count > 0:  # ADDED: x -> (x - mean) / std, clipped as in SB3's VecNormalize
+            x = torch.clamp((x - self.obs_mean) / torch.sqrt(self.obs_var + 1e-8), -10.0, 10.0)
         features = self.shared(x)
         mean = self.actor(features)
         state_value = self.critic(features)
@@ -261,7 +281,7 @@ def make_vec_env(env_id, n_envs, vectorization="async", env_kwargs=None):
 def train_agent(total_steps=200_000, update_freq=2048, env_id="Pendulum-v1",
                 lr=3e-4, gamma=0.99, gae_lambda=0.95, entropy_beta=0.0,
                 clip_epsilon=0.2, ppo_epochs=10, batch_size=64, seed=31,
-                norm_reward=False, n_envs=8, vectorization="async", verbose=True,
+                norm_reward=False, norm_obs=False, n_envs=8, vectorization="async", verbose=True,
                 out_dir=None, save_every=25, env_kwargs=None):
     """Train a PPO agent on n_envs parallel copies of the env.
 
@@ -292,6 +312,7 @@ def train_agent(total_steps=200_000, update_freq=2048, env_id="Pendulum-v1",
     std_history = []  # ADDED: policy σ after each update (exploration should shrink)
 
     reward_rms = RunningMeanStd() if norm_reward else None  # ADDED: std of the discounted return (shared)
+    obs_rms = RunningMeanStd(shape=(state_size,)) if norm_obs else None  # ADDED (4b): observation statistics
     disc_return = np.zeros(n_envs)                          # one discounted return per env
     ep_reward = np.zeros(n_envs)                            # raw episode return per env
     ep_length = np.zeros(n_envs, dtype=int)                 # ADDED: steps per episode (< limit = goal reached on EvoGym)
@@ -333,7 +354,12 @@ def train_agent(total_steps=200_000, update_freq=2048, env_id="Pendulum-v1",
             state = next_state
             steps += n_envs
 
+        rollout_states = np.asarray(agent.states)      # (T, n_envs, state_size), before update() clears the buffers
         losses = agent.update(agent.get_value(state))  # GAE masks envs whose episode just ended
+        if obs_rms is not None:
+            # ADDED (4b): new stats only after the update, so a rollout and its update see the same normalisation
+            obs_rms.update(rollout_states)
+            agent.network.set_obs_stats(obs_rms)
         actor_loss_history.append(losses["actor_loss"])
         critic_loss_history.append(losses["critic_loss"])
         std_history.append(agent.network.log_std.exp().mean().item())
@@ -414,6 +440,7 @@ def parse_args():
     p.add_argument("--robot", default=None,
                    help="EvoGym body: a name from ROBOTS (e.g. walker) or a JSON file with a 2D voxel list")
     p.add_argument("--norm-reward", action="store_true", help="optimisation: reward normalisation")
+    p.add_argument("--norm-obs", action="store_true", help="optimisation: observation normalisation (inside the network)")
     p.add_argument("--out", required=True, help="output folder, e.g. runs/pendulum_norm_s31")
     return p.parse_args()
 
@@ -431,6 +458,6 @@ if __name__ == "__main__":
         total_steps=args.steps, update_freq=args.update_freq, env_id=args.env, lr=args.lr,
         gamma=args.gamma, gae_lambda=args.gae_lambda, entropy_beta=args.entropy_beta,
         clip_epsilon=args.clip_epsilon, ppo_epochs=args.ppo_epochs, batch_size=args.batch_size,
-        seed=args.seed, norm_reward=args.norm_reward, n_envs=args.n_envs,
+        seed=args.seed, norm_reward=args.norm_reward, norm_obs=args.norm_obs, n_envs=args.n_envs,
         vectorization=args.vectorization, out_dir=out, env_kwargs=env_kwargs)
     print(f"Final avg (last 100 episodes): {np.mean(rewards[-100:]):.2f} | saved to {out}/")
