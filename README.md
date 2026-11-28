@@ -31,7 +31,7 @@ python -c "import evogym.envs; print('ok')"
 | 1 | Continuous PPO | Adapt the course PPO to continuous actions (Gaussian policy), sanity-check on Pendulum |
 | 2 | Baseline | PPO with course hyperparameters on a hand-designed robot; learning curves + GIF |
 | 3 | Analysis | Identify what limits the baseline (slow, unstable, robot not moving…) |
-| 4 | PPO optimisation | One change at a time, 2–3 seeds each: observation/reward normalisation, separate actor and critic, learning rate, entropy |
+| 4 | PPO optimisation | One change at a time, 3 seeds each: reward normalisation ❌, observation normalisation ✅ (learns ≈ 35 % faster), separate actor and critic ➖, smaller initial σ ❌. Best config: [`configs/ppo_best.json`](configs/ppo_best.json), use it with `evolve.py --ppo-config configs/ppo_best.json` (details in `notebooks/03_ppo_optimisation.ipynb`) |
 | 5 | Body evolution | Genetic algorithm over 5×5 bodies starting from random blobs (~8 robots × 8–10 generations), trained with the best PPO; compared to random bodies (generation 0) and to the hand-designed robot |
 | 6 | Terrains (extension) | Same evolution on other EvoGym terrains: stairs (`UpStepper-v0`), obstacles (`ObstacleTraverser-v0`), possibly `DownStepper-v0` or `CaveCrawler-v0`; specialisation matrix (each terrain's champion tested on the other terrains) |
 | 7 | Visuals | Custom renderer: chronophotographs of the champions, evolution frieze (best body per generation, from blob to final body), side-by-side race, GIFs, family tree |

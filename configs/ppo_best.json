@@ -1,0 +1,14 @@
+{
+  "lr": 0.0003,
+  "gamma": 0.99,
+  "gae_lambda": 0.95,
+  "entropy_beta": 0.0,
+  "clip_epsilon": 0.2,
+  "ppo_epochs": 10,
+  "batch_size": 64,
+  "update_freq": 2048,
+  "norm_reward": false,
+  "norm_obs": true,
+  "separate_critic": false,
+  "log_std_init": 0.0
+}
